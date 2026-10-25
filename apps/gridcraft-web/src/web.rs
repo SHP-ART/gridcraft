@@ -1,5 +1,8 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gridcraft_engine::Session;
 use gridcraft_ui_egui::{Inbox, Services, SheetApp};
 use wasm_bindgen::JsCast as _;
@@ -40,25 +43,42 @@ pub fn start() {
         // workbooks in it and stores what it saves (`host`).
         let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
         let app_bridge = bridge.clone();
+        let page_query = query();
+        let nextcloud = Rc::new(RefCell::new(crate::nextcloud::path_from_query(&page_query)));
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
                 options,
                 Box::new(move |cc| {
                     let inbox: Inbox = Inbox::default();
+                    let messages = Rc::new(RefCell::new(Vec::<String>::new()));
                     let mut session = Session::new();
                     // In host mode the parent sends the workbook to edit; no sample meanwhile.
-                    let q = if app_bridge.is_some() { String::new() } else { query() };
-                    if let Some(name) = q.split(['?', '&']).find_map(|kv| kv.strip_prefix("sample=")) {
-                        let _ = session.execute("file.new", serde_json::json!({"sample": name}));
-                    } else if q.contains("sample") {
-                        let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
+                    let q = if app_bridge.is_some() { String::new() } else { page_query.clone() };
+                    if nextcloud.borrow().is_none() {
+                        if let Some(name) = q.split(['?', '&']).find_map(|kv| kv.strip_prefix("sample=")) {
+                            let _ = session.execute("file.new", serde_json::json!({"sample": name}));
+                        } else if q.contains("sample") {
+                            let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
+                        }
                     }
-                    let mut services = services(inbox.clone(), cc.egui_ctx.clone());
+                    let mut services = services(inbox.clone(), cc.egui_ctx.clone(), nextcloud.clone(), messages.clone());
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
                     }
                     let mut app = SheetApp::new(session, services);
+                    app.nextcloud_path = nextcloud.borrow().clone();
+                    if app.session.active().is_none() {
+                        app.session.new_workbook();
+                    }
+                    if let Some(path) = nextcloud.borrow().as_deref() {
+                        if let Some(d) = app.session.active_mut() {
+                            d.path = Some(path.to_string());
+                        }
+                        if app_bridge.is_none() {
+                            open_from_nextcloud(path.to_string(), inbox.clone(), cc.egui_ctx.clone(), messages.clone());
+                        }
+                    }
                     app.ui.system_theme = true;
                     // Follow the browser's language, except a CJK one: the web build has no system
                     // CJK fonts (none are bundled), so that interface would render as tofu.
@@ -82,7 +102,7 @@ pub fn start() {
                         }
                         bridge.post_ready();
                     }
-                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs }))
+                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs, messages }))
                 }),
             )
             .await;
@@ -111,6 +131,7 @@ struct WebShell {
     inbox: Inbox,
     bridge: Option<crate::host::Bridge>,
     prefs: crate::prefs::PrefsSync,
+    messages: Rc<RefCell<Vec<String>>>,
 }
 
 fn local_storage() -> Option<web_sys::Storage> {
@@ -138,6 +159,10 @@ impl eframe::App for WebShell {
                     Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
                 }
             });
+        }
+        let msgs = std::mem::take(&mut *self.messages.borrow_mut());
+        for msg in msgs {
+            self.app.toast = Some((msg, 4.0));
         }
         self.app.logic(ctx);
         // Store changed preferences straight away: a reload or closed tab runs no exit code (#1562).
@@ -168,9 +193,11 @@ impl eframe::App for WebShell {
     }
 }
 
-fn services(inbox: Inbox, ctx: egui::Context) -> Services {
+fn services(inbox: Inbox, ctx: egui::Context, nextcloud: Rc<RefCell<Option<String>>>, messages: Rc<RefCell<Vec<String>>>) -> Services {
     let open_inbox = inbox.clone();
     let picture_ctx = ctx.clone();
+    let save_ctx = ctx.clone();
+    let save_messages = messages.clone();
     Services {
         copy_html: Some(Box::new(copy_html)),
         open_async: Some(Box::new(move || {
@@ -200,9 +227,18 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 ctx.request_repaint();
             });
         })),
-        download: Some(Box::new(|name: &str, bytes: &[u8]| {
-            if let Err(e) = download(name, bytes) {
-                log::error!("download of {name} failed: {e}");
+        download: Some(Box::new(move |name: &str, bytes: &[u8]| match crate::nextcloud::save_target(nextcloud.borrow().as_deref(), name) {
+            Some(target) => {
+                save_messages.borrow_mut().push(format!("Speichere in Nextcloud: {target}"));
+                if let Err(e) = save_to_nextcloud(&save_ctx, &save_messages, target, bytes) {
+                    log::error!("Nextcloud save failed: {e}");
+                }
+            }
+            None => {
+                save_messages.borrow_mut().push("Speichern als Download (kein Nextcloud-Bezug)".into());
+                if let Err(e) = download(name, bytes) {
+                    log::error!("download of {name} failed: {e}");
+                }
             }
         })),
         print: Some(Box::new(|bytes: &[u8]| {
@@ -472,5 +508,66 @@ fn trigger_anchor_download(window: &web_sys::Window, name: &str, bytes: &[u8]) -
         web_sys::Url::revoke_object_url(&url).ok();
     });
     window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(js)?;
+    Ok(())
+}
+
+/// Load `path` through the Nextcloud passage into the inbox, as if it had been picked.
+fn open_from_nextcloud(path: String, inbox: Inbox, ctx: egui::Context, messages: Rc<RefCell<Vec<String>>>) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let result: Result<Option<Vec<u8>>, String> = async {
+            let window = web_sys::window().ok_or("no window")?;
+            let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(&crate::nextcloud::url_for(&path)))
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .dyn_into()
+                .map_err(|_| "no response".to_string())?;
+            let status = resp.status();
+            if status == 404 {
+                return Ok(None);
+            }
+            if !resp.ok() {
+                return Err(format!("HTTP {status}"));
+            }
+            let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await.map_err(|e| format!("{e:?}"))?;
+            Ok(Some(js_sys::Uint8Array::new(&buf).to_vec()))
+        }
+        .await;
+        match result {
+            Ok(Some(bytes)) => {
+                let name = crate::nextcloud::file_name(&path).to_string();
+                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                messages.borrow_mut().push(format!("Aus Nextcloud geöffnet: {path}. Speichern schreibt die Datei dorthin zurück."));
+            }
+            Ok(None) => {
+                messages.borrow_mut().push(format!("Neue Datei in Nextcloud: {path}. Speichern legt sie dort an."));
+            }
+            Err(e) => {
+                log::error!("couldn't load {path} from Nextcloud: {e}");
+                messages.borrow_mut().push(format!("Konnte {path} nicht aus Nextcloud laden ({e})."));
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Write `bytes` to `path` in Nextcloud (HTTP PUT through the passage).
+fn save_to_nextcloud(ctx: &egui::Context, messages: &Rc<RefCell<Vec<String>>>, path: String, bytes: &[u8]) -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("PUT");
+    init.set_body(&js_sys::Uint8Array::from(bytes).into());
+    let prom = window.fetch_with_str_and_init(&crate::nextcloud::url_for(&path), &init);
+    let ctx = ctx.clone();
+    let messages = messages.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let outcome = match wasm_bindgen_futures::JsFuture::from(prom).await.map(|r| r.dyn_into::<web_sys::Response>()) {
+            Ok(Ok(resp)) if resp.ok() => format!("In Nextcloud gespeichert: {path}"),
+            Ok(Ok(resp)) => format!("Nextcloud hat das Speichern abgelehnt (HTTP {})", resp.status()),
+            Ok(Err(_)) => "Nextcloud: keine Antwort".into(),
+            Err(e) => format!("Nextcloud nicht erreichbar: {e:?}"),
+        };
+        messages.borrow_mut().push(outcome);
+        ctx.request_repaint();
+    });
     Ok(())
 }

@@ -301,6 +301,7 @@ pub struct SheetApp {
     /// A run of Tabs: (doc uid, sheet, column it started in, cell the last Tab landed on).
     /// Enter on that cell goes to the next row in the starting column, as in Excel (#911).
     tab_run: Option<(u64, usize, u32, CellRef)>,
+    pub nextcloud_path: Option<String>,
     pub started: f64,
     /// Every unsaved workbook has been answered for quitting (or `app.quit` asked): the next
     /// window close goes through.
@@ -349,6 +350,7 @@ impl SheetApp {
             clipboard_text_at_copy: None,
             cut_text: None,
             tab_run: None,
+            nextcloud_path: None,
             started: now_ms(),
             allow_close: false,
         }
@@ -421,6 +423,10 @@ impl SheetApp {
             )
         {
             self.commit_text_box_edit()?;
+        }
+        // Web: Save/Save As have no file system; hand the bytes to the browser's download hook.
+        if self.services.download.is_some() && matches!(id, "file.save" | "file.saveAs") {
+            return self.web_save(id, &params);
         }
         if let Some(r) = self.run_ui_command(id, &params) {
             return r;
@@ -527,6 +533,34 @@ impl SheetApp {
             let title = self.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());
             dl(&std::path::Path::new(&title).with_extension("pdf").to_string_lossy(), &b);
         }
+    }
+
+    /// Web: Save/Save As writes the workbook bytes through `services.download`.
+    fn web_save(&mut self, _id: &str, params: &Json) -> Result<Json, String> {
+        let mut name = params
+            .get("path")
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .or_else(|| self.session.active().and_then(|d| d.path.clone()))
+            .unwrap_or_else(|| {
+                let title = self.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());
+                format!("{title}.xlsx")
+            });
+        if std::path::Path::new(&name).extension().is_none() {
+            name.push_str(".xlsx");
+        }
+        let d = self.session.doc().map_err(|e| e.to_string())?;
+        let bytes = gridcraft_engine::io::save_bytes(&d.wb, &name).map_err(|e| e.to_string())?;
+        if let Some(dl) = &self.services.download {
+            dl(&name, &bytes);
+        }
+        // A full-fidelity .xlsx download counts as saved, even though the browser keeps the copy.
+        if name.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("xlsx"))
+            && let Some(d) = self.session.active_mut()
+        {
+            d.saved = d.wb.clone();
+        }
+        Ok(json!({"downloaded": name, "bytes": bytes.len()}))
     }
 
     /// Runs a command and shows its error in a message box (for menu/ribbon clicks).
@@ -1254,6 +1288,15 @@ impl SheetApp {
                 Ok(r) => {
                     self.backstage = None;
                     self.show_open_warnings(&r);
+                    // A file opened from Nextcloud via ?nc=... was fed through the inbox under its
+                    // file name only; make the active document's path the full cloud path so
+                    // File › Save writes back there.
+                    if let Some(nc) = &self.nextcloud_path
+                        && std::path::Path::new(nc).file_name().map(|n| n.to_string_lossy().to_string()) == Some(name)
+                        && let Some(d) = self.session.active_mut()
+                    {
+                        d.path = Some(nc.clone());
+                    }
                 }
                 Err(e) if e.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
                     self.backstage = None;
